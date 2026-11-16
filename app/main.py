@@ -1,0 +1,77 @@
+import asyncio
+import contextlib
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pymongo import AsyncMongoClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.config import settings
+from app.db import Cols, adopt_orphans, ensure_index
+from app.jobs.appetite import appetite_scheduler
+from app.routers import (
+    feeders,
+    alerts,
+    auth,
+    cows,
+    eleveurs,
+    invites,
+    profiles,
+    subscription,
+    superuser,
+    ws,
+)
+from app.security import ensure_bootstrap_superuser, ensure_default_admin
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    client = AsyncMongoClient(settings.mongo_uri)
+    cols = Cols(client[settings.mongo_db])
+    app.state.cols = cols
+
+    await ensure_index(cols)
+    await ensure_bootstrap_superuser(cols)
+    default_admin_id = await ensure_default_admin(cols)
+
+    if default_admin_id is not None:
+        await adopt_orphans(cols, default_admin_id)
+
+    tasks = []
+
+    if settings.eod_enabled:
+        tasks.append(asyncio.create_task(appetite_scheduler(cols)))
+
+    yield
+
+    for task in tasks:
+        task.cancel()
+
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    await client.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(_: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        {"error": exc.detail, "detail": exc.detail},
+        status_code=exc.status_code,
+    )
+
+
+app.include_router(cows.router)
+app.include_router(auth.router)
+app.include_router(invites.router)
+app.include_router(eleveurs.router)
+app.include_router(profiles.router)
+app.include_router(alerts.router)
+app.include_router(subscription.router)
+app.include_router(superuser.router)
+app.include_router(feeders.router)
