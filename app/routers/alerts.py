@@ -87,11 +87,24 @@ async def list_alerts(request: Request, status: Optional[Literal["unread", "read
 
 @router.patch("/{alert_id}/read")
 async def mark_read(alert_id: str, request: Request, actor: dict = Depends(get_actor)):
-    if actor["role"] != "eleveur":
-        raise HTTPException(403, "Only the éleveur marks his alerts as read")
+    # L'éleveur ET l'admin (app admin) peuvent marquer une alerte comme lue.
     res = await request.app.state.cols.alerts.update_one(
         {"_id": to_oid(alert_id), "admin_id": actor["admin_id"]},
         {"$set": {"status": "read", "read_at": datetime.now(timezone.utc)}})
     if res.matched_count == 0:
         raise HTTPException(404, "Alert not found")
     return {"status": "read"}
+
+
+@router.delete("/{alert_id}")
+async def delete_alert(alert_id: str, request: Request, admin: dict = Depends(admin_only)):
+    """Supprime une alerte déjà lue (l'admin uniquement)."""
+    alerts = request.app.state.cols.alerts
+    flt = {"_id": to_oid(alert_id), "admin_id": admin["admin_id"]}
+    alert = await alerts.find_one(flt, {"status": 1})
+    if alert is None:
+        raise HTTPException(404, "Alert not found")
+    if alert.get("status") != "read":
+        raise HTTPException(409, "Only read alerts can be deleted")
+    await alerts.delete_one(flt)
+    return {"deleted": 1}

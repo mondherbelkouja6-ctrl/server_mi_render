@@ -1,8 +1,9 @@
 from datetime import datetime, time, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 
-from app.deps import get_actor, owner_filter
+from app.deps import admin_only, get_actor, owner_filter
 
 router = APIRouter(prefix="/feeders", tags=["feeders"])
 
@@ -61,3 +62,29 @@ async def list_feeders(request: Request, actor: dict = Depends(get_actor)):
         })
 
     return result
+
+
+class RefillIn(BaseModel):
+    quantity_g: int = Field(gt=0, le=1_000_000)
+
+
+@router.post("/{feeder_id}/refill")
+async def refill_feeder(feeder_id: str, body: RefillIn, request: Request,
+                        admin: dict = Depends(admin_only)):
+    """Ajoute de l'aliment disponible dans la mangeoire (sans dépasser la capacité)."""
+    feeders = request.app.state.cols.feeders
+    flt = {"_id": feeder_id, **owner_filter(admin)}
+    feeder = await feeders.find_one(flt)
+    if feeder is None:
+        raise HTTPException(404, "Feeder not found")
+    capacity = int(feeder.get("capacity_g", 0) or 0)
+    quantity = int(feeder.get("current_quantity_g", 0) or 0)
+    new_quantity = quantity + body.quantity_g
+    if capacity > 0 and new_quantity > capacity:
+        free_kg = max(capacity - quantity, 0) / 1000
+        raise HTTPException(400, f"Exceeds capacity: only {free_kg:.1f} kg of space left")
+    now = datetime.now(timezone.utc)
+    await feeders.update_one(flt, {"$set": {"current_quantity_g": new_quantity,
+                                            "last_refill_at": now}})
+    return {"id": feeder_id, "current_quantity_g": new_quantity,
+            "capacity_g": capacity, "last_refill_at": now}
